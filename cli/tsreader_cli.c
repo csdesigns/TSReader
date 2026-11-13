@@ -384,6 +384,373 @@ double tsr_total_bitrate_bps(const tsr_mux_t *m)
 
 static void tsr_extract_init_stream(tsr_mux_t *m, tsr_stream_t *s);
 
+// ---- PES unwrapping for extraction (H.222.0) --------------------------------
+//
+// Behaviour mirrors tstools' ts2es (the reference oracle) byte for byte:
+//
+//  - A PES start code ('00 00 01' + stream id) may appear anywhere in a
+//    PUSI payload; the bytes before it are the tail of the previous unit
+//    and are preserved.
+//  - The start code (or the whole header) can straddle into the next TS
+//    packet; partial bytes are staged in s->pes_pend until the header is
+//    complete.
+//  - A non-zero PES_packet_length defines the unit's ES size (declared -
+//    (3 + hd) octets). When a declared-length unit ends inside a PUSI
+//    packet, the next unit starts right there and is scanned in place.
+//  - Unwrapped streams (ADTS per ISO/IEC 13818-7, some raw muxes) carry
+//    no header at all. ADTS and PES streams are byte-indistinguishable in
+//    a single packet, so a sticky rule applies: the first start code seen
+//    turns ADTS treatment off for good, and a stream whose first few PUSI
+//    payloads all begin with the 0xFFF sync and yield no start code is
+//    treated as raw ADTS.
+//  - Stream ids below 0xC0 (MPEG-1 PS pack/system, pre-1995) are not
+//    unwrapped: they pass through raw (documented divergence from ts2es,
+//    which approximates their header length).
+
+static void tsr_write_es(tsr_stream_t *s, const uint8_t *data, int len)
+{
+    if (len > 0)
+        s->out_bytes += fwrite(data, 1, (size_t)len, s->out);
+}
+
+// Return the offset of the first PES start code at or after `from`, or -1.
+static int tsr_find_pes_start(const uint8_t *b, int len, int from)
+{
+    for (int i = from; i + 3 < len; i++) {
+        if (b[i] != 0 || b[i + 1] != 0 || b[i + 2] != 1)
+            continue;
+        if (b[i + 3] < 0xC0)
+            continue;
+        // Stream ids 0xC0-0xFF must carry the H.222.0 marker bits; a
+        // mid-NAL '00 00 01 xx' pattern usually fails this and is skipped.
+        if (i + 6 < len && (b[i + 6] & 0xC0) != 0x80)
+            continue;
+        return i;
+    }
+    return -1;
+}
+
+// Parse the PES header at start code buf[f]. On success sets *pos (the ES
+// offset within buf) and *unit_left (the unit's ES size, 0 when unknown)
+// and returns 0. If the header does not complete within buf, it is staged
+// in s for the next packet and 1 is returned.
+static int tsr_parse_pes_header(tsr_stream_t *s, const uint8_t *buf,
+                                int blen, int f, int *pos, int *unit_left)
+{
+    int declared;
+    int hd;
+
+    if (f + 8 >= blen) {
+        // The header does not complete in this packet: stage it.
+        memcpy(s->pes_pend, buf + f, (size_t)(blen - f));
+        s->pes_pend_len = blen - f;
+        s->pes_hdr_total = 0;
+        return 1;
+    }
+    // H.222.0: the ES data starts PES_header_data_length bytes after the
+    // 16-bit length field (9 bytes from the start code). Field offsets are
+    // anchored on the three-byte '00 00 01' view, which is the same whether
+    // the start code was written with three or four zero bytes. PES_packet_
+    // length (when non-zero) counts octets from after the length field, so
+    // the PES carries declared - (3 + hd) ES octets.
+    declared = (buf[f + 4] << 8) | buf[f + 5];
+    hd = buf[f + 8];
+    *pos = f + 9 + hd;
+    *unit_left = 0;
+    if (declared > 0) {
+        *unit_left = declared - (3 + hd);
+        if (*unit_left < 0)
+            *unit_left = 0;
+    }
+    if (*pos > blen) {
+        // The header fits, but the ES starts in the next packet: stage the
+        // (complete) header bytes.
+        memcpy(s->pes_pend, buf + f, (size_t)(blen - f));
+        s->pes_pend_len = blen - f;
+        s->pes_hdr_total = 9 + hd;
+        return 1;
+    }
+    return 0;
+}
+
+// Write the current unit's ES from buf[pos] onward. When a declared-length
+// unit ends inside the buffer, the next unit starts right after it: scan
+// for and parse that start (only ever called for PUSI packets, the only
+// place a new unit may start).
+static void tsr_emit_unit_es(tsr_stream_t *s, const uint8_t *buf, int blen,
+                             int *pos)
+{
+    for (;;) {
+        int avail = blen - *pos;
+        int w = avail;
+
+        if (s->pes_unit_left > 0 && w > s->pes_unit_left)
+            w = s->pes_unit_left;
+        tsr_write_es(s, buf + *pos, w);
+        *pos += w;
+
+        if (s->pes_unit_left == 0)
+            break;             // unknown-length unit carries on
+        s->pes_unit_left -= w;
+        if (s->pes_unit_left > 0)
+            break;             // unit continues in later packets
+
+        // A declared-length unit ended right here.
+        if (*pos >= blen)
+            break;
+        int f = tsr_find_pes_start(buf, blen, *pos);
+        if (f < 0) {
+            // No start code visible: the next unit's start code may
+            // straddle into the next packet (at most 3 bytes here). Hold
+            // a start-code prefix; preserve anything else (malformed).
+            int rest = blen - *pos;
+            int prefix = 0;
+
+            if (rest == 3 && buf[*pos] == 0 && buf[*pos + 1] == 0 &&
+                buf[*pos + 2] == 1)
+                prefix = 3;
+            else
+                while (prefix < rest && buf[*pos + prefix] == 0)
+                    prefix++;
+            if (prefix > 0 && prefix == rest) {
+                memcpy(s->pes_pend, buf + *pos, (size_t)rest);
+                s->pes_pend_len = rest;
+                s->pes_hdr_total = 0;
+            } else if (rest > 0) {
+                tsr_write_es(s, buf + *pos, rest);
+                *pos += rest;
+            }
+            break;
+        }
+        if (f > *pos)
+            tsr_write_es(s, buf + *pos, f - *pos);   // gap (shouldn't happen)
+        if (tsr_parse_pes_header(s, buf, blen, f, pos, &s->pes_unit_left))
+            break;   // staged for the next packet
+    }
+}
+
+// Feed one payload packet of an extraction stream.
+static void tsr_extract_packet(tsr_stream_t *s, const uint8_t *pkt,
+                               const uint8_t *payload, int paylen)
+{
+    int pusi = (pkt[1] >> 6) & 1;
+    uint8_t buf[288 + 204];
+    int blen;
+    int had_pend;
+    int pos;
+
+    if (pusi) {
+        if (s->need_unit_start)
+            s->need_unit_start = 0;
+
+        if (!s->pes_stream && !s->adts_stream) {
+            s->pusi_seen++;
+            if (tsr_find_pes_start(payload, paylen, 0) >= 0)
+                s->pes_stream = 1;
+            else if (s->pusi_seen >= 4 && paylen >= 2 &&
+                     payload[0] == 0xFF && (payload[1] & 0xF0) == 0xF0)
+                s->adts_stream = 1;
+        }
+        if (s->adts_stream) {
+            // Unwrapped AAC (ADTS, ISO/IEC 13818-7): raw passthrough.
+            s->pes_unit_open = 0;
+            s->pes_unit_left = 0;
+            tsr_write_es(s, payload, paylen);
+            return;
+        }
+
+        had_pend = s->pes_pend_len;
+        memcpy(buf, s->pes_pend, (size_t)had_pend);
+        memcpy(buf + had_pend, payload, (size_t)paylen);
+        blen = had_pend + paylen;
+        s->pes_pend_len = 0;
+
+        do {
+            int f;
+            int unit_left;
+
+            pos = 0;
+            if (had_pend >= 4) {
+                // A partial PES header staged from the previous packet
+                // (start code + id are within the staged bytes).
+                if (tsr_parse_pes_header(s, buf, blen, 0, &pos, &unit_left))
+                    break;   // staged for the next packet
+                s->pes_unit_left = unit_left;
+                s->pes_unit_open = 1;
+            } else if (had_pend > 0) {
+                // A partial start code (1-3 staged bytes).
+                f = tsr_find_pes_start(buf, blen, 0);
+                if (f < 0) {
+                    // Still incomplete: a start code straddling 3+ packets
+                    // is pathological - flush everything (staged bytes
+                    // included) as ES and give up staging.
+                    tsr_write_es(s, buf, blen);
+                    break;
+                }
+                if (f > had_pend)
+                    tsr_write_es(s, buf, f);
+                if (tsr_parse_pes_header(s, buf, blen, f, &pos, &unit_left))
+                    break;   // staged for the next packet
+                s->pes_unit_left = unit_left;
+                s->pes_unit_open = 1;
+            } else if (!s->pes_unit_open) {
+                // Fresh start: find the unit's start code.
+                f = tsr_find_pes_start(buf, blen, 0);
+                if (f < 0) {
+                    // No start code: raw data (unwrapped stream, or a
+                    // start code straddling into the next packet). We must
+                    // NOT read buf[4..5] as a "PES packet length": for
+                    // unwrapped streams those are just ES bytes, and
+                    // clamping continuation packets to it silently dropped
+                    // data.
+                    s->pes_unit_open = 0;
+                    s->pes_unit_left = 0;
+                    tsr_write_es(s, buf, blen);
+                    break;
+                }
+                if (f > 0)
+                    tsr_write_es(s, buf, f);
+                s->pes_unit_open = 1;
+                if (tsr_parse_pes_header(s, buf, blen, f, &pos, &unit_left))
+                    break;   // staged for the next packet
+                s->pes_unit_left = unit_left;
+            } else {
+                // A unit from a previous packet is in flight; this PUSI
+                // packet carries its tail and the start of the next unit.
+                f = tsr_find_pes_start(buf, blen, 0);
+                if (f < 0) {
+                    if (s->pes_unit_left > 0 && s->pes_unit_left <= blen) {
+                        // The in-flight unit (declared length) ends inside
+                        // this packet; anything after it is a start code
+                        // straddling into the next packet (at most 3
+                        // bytes).
+                        int rest = blen - s->pes_unit_left;
+                        tsr_write_es(s, buf, s->pes_unit_left);
+                        s->pes_unit_left = 0;
+                        s->pes_unit_open = 0;
+                        if (rest > 0 && rest <= 3) {
+                            memcpy(s->pes_pend, buf + blen - rest,
+                                   (size_t)rest);
+                            s->pes_pend_len = rest;
+                            s->pes_hdr_total = 0;
+                        } else if (rest > 3) {
+                            // No start code here (malformed): preserve.
+                            tsr_write_es(s, buf + blen - rest, rest);
+                        }
+                    } else {
+                        // The unit (unknown length, or longer than this
+                        // packet) carries on: raw.
+                        tsr_write_es(s, buf, blen);
+                        if (s->pes_unit_left > 0)
+                            s->pes_unit_left -= blen;
+                    }
+                    break;
+                }
+                {
+                    int lead = f;
+                    if (s->pes_unit_left > 0) {
+                        // The in-flight unit ends at or before the start
+                        // code.
+                        if (s->pes_unit_left < f)
+                            lead = s->pes_unit_left;
+                        s->pes_unit_left = 0;
+                    }
+                    if (lead > 0)
+                        tsr_write_es(s, buf, lead);
+                    if (f > lead)
+                        tsr_write_es(s, buf + lead, f - lead);   // gap
+                    s->pes_unit_open = 1;
+                    if (tsr_parse_pes_header(s, buf, blen, f, &pos, &unit_left))
+                        break;   // staged for the next packet
+                    s->pes_unit_left = unit_left;
+                }
+            }
+            tsr_emit_unit_es(s, buf, blen, &pos);
+        } while (0);
+        return;
+    }
+
+    // Continuation packet (no PUSI).
+    if (s->need_unit_start)
+        return;   // nothing we can use before the first PUSI
+
+    had_pend = s->pes_pend_len;
+    memcpy(buf, s->pes_pend, (size_t)had_pend);
+    memcpy(buf + had_pend, payload, (size_t)paylen);
+    blen = had_pend + paylen;
+    s->pes_pend_len = 0;
+
+    pos = 0;
+    if (had_pend > 0) {
+        int f;
+        int unit_left;
+
+        if (had_pend >= 4) {
+            // Complete a partial PES header staged from the previous
+            // packet.
+            if (tsr_parse_pes_header(s, buf, blen, 0, &pos, &unit_left))
+                return;   // staged for the next packet
+            s->pes_unit_left = unit_left;
+            s->pes_unit_open = 1;
+        } else {
+            // Complete a partial start code staged from the previous
+            // packet.
+            f = tsr_find_pes_start(buf, blen, 0);
+            if (f < 0) {
+                // Still incomplete: a start code straddling 3+ packets is
+                // pathological - flush everything (staged bytes included)
+                // as ES and give up staging.
+                tsr_write_es(s, buf, blen);
+                return;
+            }
+            if (f > had_pend)
+                tsr_write_es(s, buf, f);
+            if (tsr_parse_pes_header(s, buf, blen, f, &pos, &unit_left))
+                return;   // staged for the next packet
+            s->pes_unit_left = unit_left;
+            s->pes_unit_open = 1;
+        }
+    } else if (!s->pes_unit_open) {
+        // A continuation with no unit in flight (stream started mid-
+        // flight, or a raw unwrapped stream): pass through.
+        tsr_write_es(s, payload, paylen);
+        return;
+    }
+
+    {
+        int avail = blen - pos;
+        int w = avail;
+        if (s->pes_unit_left > 0 && w > s->pes_unit_left)
+            w = s->pes_unit_left;
+        tsr_write_es(s, buf + pos, w);
+        pos += w;
+        if (s->pes_unit_left > 0) {
+            s->pes_unit_left -= w;
+        } else {
+            // The unit ended inside this continuation packet (only
+            // possible for declared-length units): the trailing bytes are
+            // a start code straddling the next packet (hold them) or
+            // malformed (preserve them).
+            int rest = blen - pos;
+            int prefix = 0;
+
+            if (rest == 3 && buf[pos] == 0 && buf[pos + 1] == 0 &&
+                buf[pos + 2] == 1)
+                prefix = 3;
+            else
+                while (prefix < rest && buf[pos + prefix] == 0)
+                    prefix++;
+            if (prefix > 0 && prefix == rest) {
+                memcpy(s->pes_pend, buf + pos, (size_t)rest);
+                s->pes_pend_len = rest;
+                s->pes_hdr_total = 0;
+            } else if (rest > 0) {
+                tsr_write_es(s, buf + pos, rest);
+            }
+        }
+    }
+}
+
 void tsr_process_packet(tsr_mux_t *m, const uint8_t *pkt)
 {
     if (pkt[0] != 0x47) {
@@ -481,7 +848,9 @@ void tsr_process_packet(tsr_mux_t *m, const uint8_t *pkt)
     // first access unit is not lost, then flushed on open.
     if (paylen > 0 && (m->extract_dir[0] || m->n_extract_pids)) {
         if (s->out) {
-            s->out_bytes += fwrite(payload, 1, paylen, s->out);
+            // H.222.0 unwrapping, mirroring tstools' ts2es (see the helper
+            // block above for the full behaviour contract).
+            tsr_extract_packet(s, pkt, payload, paylen);
         } else {
             if (!m->pmt_seen && s->role == TSR_ROLE_NONE) {
                 if (!s->prebuf)
@@ -538,8 +907,20 @@ static void tsr_extract_init_stream(tsr_mux_t *m, tsr_stream_t *s)
     snprintf(fn, sizeof(fn), "%s/extract_%s_%03X.es", m->extract_dir, cname,
              s->pid);
     s->out = fopen(fn, "wb");
-    if (s->out)
+    if (s->out) {
         snprintf(s->out_path, sizeof(s->out_path), "%s", fn);
+        // Fresh PES-unwrap state for this extraction run (the pre-buffered
+        // bytes are flushed raw, as before; unwrapping starts here).
+        memset(s->pes_pend, 0, sizeof(s->pes_pend));
+        s->pes_pend_len = 0;
+        s->pes_hdr_total = 0;
+        s->pes_unit_left = 0;
+        s->pes_unit_open = 0;
+        s->need_unit_start = 1;
+        s->pes_stream = 0;
+        s->adts_stream = 0;
+        s->pusi_seen = 0;
+    }
 }
 
 // Exposed for tsreader_si.c: (re)open extraction once a PMT assigns a

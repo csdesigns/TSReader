@@ -93,6 +93,19 @@ typedef struct tsr_stream {
     uint64_t out_bytes;
     uint8_t *prebuf;       // payloads received before the output opened
     size_t   prebuf_len;
+    // PES unwrapping state for extraction (H.222.0). Mirrors tstools'
+    // ts2es: a PES header (max 9 + 255 = 264 bytes) can straddle TS
+    // packet boundaries, so header bytes are staged here (from the start
+    // code) until the header is complete.
+    uint8_t  pes_pend[288];
+    int      pes_pend_len;    // staged header bytes
+    int      pes_hdr_total;   // staged header size (9 + hd); 0 = unknown
+    int      pes_unit_left;   // ES bytes left in current unit (0 = unknown)
+    int      pes_unit_open;
+    int      need_unit_start; // skip data until the first PUSI
+    int      pes_stream;      // sticky: a PES start code has been seen
+    int      adts_stream;     // sticky: unwrapped ADTS (raw passthrough)
+    int      pusi_seen;
 } tsr_stream_t;
 
 typedef struct tsr_program {
