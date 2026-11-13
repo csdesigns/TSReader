@@ -1,5 +1,8 @@
 # Build output 
 build/ 
+build-cli/
+build-cli-asan/
+
 Debug/ 
 Release/ 
 *.obj 
