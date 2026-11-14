@@ -21,7 +21,10 @@
 # ~/tstools/bin or PATH.
 #
 # Usage:
-#   cli/selftest.sh [options] <input.ts> [<input.ts> ...]
+#   cli/selftest.sh [options] [<input.ts> ...]
+#
+# With no inputs, runs the in-repo fixtures in testdata/ (their
+# <input>.truth/ ground-truth sidecars are picked up automatically).
 #
 # Options:
 #   --build-dir DIR  shared scratch/build dir (default: fresh mktemp -d)
@@ -77,10 +80,16 @@ while [ $# -gt 0 ]; do
 done
 
 if [ ${#FILES[@]} -eq 0 ]; then
-  usage
-  echo >&2
-  echo "error: at least one input .ts file is required" >&2
-  exit 2
+  # No inputs: fall back to the in-repo fixtures (testdata/).
+  for f in "$SRCDIR/testdata/dvb2.ts" "$SRCDIR/testdata/demo3s.ts"; do
+    [ -r "$f" ] && FILES+=("$f")
+  done
+  if [ ${#FILES[@]} -eq 0 ]; then
+    usage
+    echo >&2
+    echo "error: no input .ts file given and no fixtures in $SRCDIR/testdata/" >&2
+    exit 2
+  fi
 fi
 
 # -----------------------------------------------------------------------------
