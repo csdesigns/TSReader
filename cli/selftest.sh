@@ -35,6 +35,10 @@
 #   --no-record      skip the record round-trip check
 #   --oracle DIR     dir containing tsinfo and ts2es
 #   --no-oracle      skip all oracle differential checks
+#   --hdhr URL       record an HDHomeRun source (host[:port]/tune-url, e.g.
+#                    192.168.1.16/auto/v5.1) for HDHR_SECS seconds, then run
+#                    the full matrix on the capture (replaces the file list)
+#   --hdhr-secs N    capture duration for --hdhr (default 10)
 #   -h, --help       this text
 #
 # Exit status: 0 = all checks passed (WARN/SKIP allowed), 1 = any FAIL.
@@ -57,10 +61,12 @@ DO_EXTRACT=1
 DO_RECORD=1
 ORACLE_DIR=""
 USE_ORACLE=1
+HDHR_URL=""
+HDHR_SECS=10
 FILES=()
 
 usage() {
-  sed -n '18,42p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '/^# Usage:/,/^#   -h, --help/p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -73,6 +79,8 @@ while [ $# -gt 0 ]; do
     --no-record)  DO_RECORD=0; shift ;;
     --oracle)     ORACLE_DIR=$2; shift 2 ;;
     --no-oracle)  USE_ORACLE=0; shift ;;
+    --hdhr)       HDHR_URL=$2; shift 2 ;;
+    --hdhr-secs)  HDHR_SECS=$2; shift 2 ;;
     -h|--help)    usage; exit 0 ;;
     -*)  echo "unknown option: $1" >&2; exit 2 ;;
     *)   FILES+=("$1"); shift ;;
@@ -190,7 +198,40 @@ if [ "$USE_ORACLE" -eq 1 ]; then
 else
   echo "  oracle  : disabled"
 fi
+if [ -n "$HDHR_URL" ]; then
+  echo "  hdhr    : $HDHR_URL (${HDHR_SECS}s capture)"
+fi
 echo
+
+# -----------------------------------------------------------------------------
+# optional live HDHomeRun capture
+# -----------------------------------------------------------------------------
+if [ -n "$HDHR_URL" ]; then
+  CAP="$BUILD_DIR/hdhr_capture.ts"
+  if [ ! -x "$REL" ]; then
+    report FAIL "hdhr_cap.ts" "hdhr capture" "release build missing"
+  else
+    "$REL" record -H "$HDHR_URL" --duration "$HDHR_SECS" -o "$CAP" \
+      > "$BUILD_DIR/hdhr_rec.log" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      report FAIL "hdhr_cap.ts" "hdhr capture" \
+        "record rc=$rc (device reachable?) — see $BUILD_DIR/hdhr_rec.log"
+      sed -n '1,8p' "$BUILD_DIR/hdhr_rec.log" | sed 's/^/       /'
+    else
+      csize=$( [ -s "$CAP" ] && wc -c < "$CAP" | tr -d ' ' )
+      [ -n "$csize" ] || csize=0
+      if [ "$csize" -gt 0 ] && [ $((csize % 188)) -eq 0 ]; then
+        report PASS "hdhr_cap.ts" "hdhr capture" "$csize B from $HDHR_URL"
+        FILES=("$CAP")
+      else
+        report FAIL "hdhr_cap.ts" "hdhr capture" \
+          "bad capture size=${csize} (not a positive multiple of 188)"
+      fi
+    fi
+  fi
+  echo
+fi
 
 # -----------------------------------------------------------------------------
 # per-file checks

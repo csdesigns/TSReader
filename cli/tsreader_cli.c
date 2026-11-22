@@ -210,6 +210,7 @@ int tsr_open_udp(tsr_mux_t *m, const char *addr, int port, const char *iface)
     snprintf(m->input_desc, sizeof(m->input_desc),
              "udp://%s:%d%s%s", addr ? addr : "*", port,
              (iface && *iface) ? "?" : "", (iface && *iface) ? iface : "");
+    tsr_mark_stream_start(m);
     return 0;
 }
 
@@ -244,7 +245,16 @@ int tsr_open_tcp(tsr_mux_t *m, const char *host, int port)
     m->sock = s;
     m->live = 1;
     snprintf(m->input_desc, sizeof(m->input_desc), "tcp://%s:%d", host, port);
+    tsr_mark_stream_start(m);
     return 0;
+}
+
+void tsr_mark_stream_start(tsr_mux_t *m)
+{
+    if (!m->wall_valid) {
+        m->wall_start = now_secs();
+        m->wall_valid = 1;
+    }
 }
 
 // ---- realignment + feed ----------------------------------------------------
@@ -1049,12 +1059,28 @@ static int live_reader(void *arg)
             break;
         }
         tsr_feed(m, buf, (size_t)n);
-        if ((m->max_duration &&
+        if ((m->wall_valid && m->max_duration &&
              (now_secs() - m->wall_start) >= m->max_duration) ||
             (m->max_bytes && m->total_bytes >= m->max_bytes))
             break;
     }
+    m->live_reader_done = 1;
     return 0;
+}
+
+// Generic live-reader thread body: runs the source-specific reader
+// (built-in socket reader, or the HDHomeRun reader installed by
+// tsr_open_hdhr) and signals completion so tsr_process can exit even
+// if the input dies before the duration/byte limits are reached.
+static void *live_wrapper(void *arg)
+{
+    tsr_mux_t *m = arg;
+    if (m->live_reader_fn)
+        m->live_reader_fn(m);
+    else
+        live_reader(m);
+    m->live_reader_done = 1;
+    return NULL;
 }
 
 int tsr_process(tsr_mux_t *m, volatile int *stop)
@@ -1062,12 +1088,15 @@ int tsr_process(tsr_mux_t *m, volatile int *stop)
     if (m->live) {
         pthread_t th;
         m->stop_flag = stop;
-        if (pthread_create(&th, NULL, (void *(*)(void *))live_reader, m) != 0) {
+        m->live_reader_done = 0;
+        if (pthread_create(&th, NULL, live_wrapper, m) != 0) {
             // Fallback: run inline.
-            live_reader(m);
+            live_wrapper(m);
         } else {
-            while ((!stop || !*stop) &&
-                   !((m->max_duration && (now_secs() - m->wall_start) >= m->max_duration) ||
+            while (!m->live_reader_done &&
+                   (!stop || !*stop) &&
+                   !((m->wall_valid && m->max_duration &&
+                       (now_secs() - m->wall_start) >= m->max_duration) ||
                      (m->max_bytes && m->total_bytes >= m->max_bytes))) {
                 struct timespec ts = {0, 100 * 1000 * 1000};
                 nanosleep(&ts, NULL);

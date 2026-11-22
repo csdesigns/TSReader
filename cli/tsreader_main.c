@@ -14,6 +14,10 @@
 //   --max-mb N        stop after N megabytes of TS input
 //   -u addr[:port]    UDP input (default port 1234)
 //   -t host:port      TCP input
+//   -H host[:port]/tune-url
+//                     HDHomeRun input (default port 5004); the tune URL is
+//                     passed to the device unchanged, e.g.
+//                     -H 192.168.1.1/auto/v5.1  or  -H 192.168.1.1/atsc://12/12.1
 //   -i IFACE          UDP interface (name or address)
 //   -e prog=N|pid=0xNNN  elementary stream extraction (repeatable)
 //   -o PATH           output file (record) or directory (extract)
@@ -45,6 +49,8 @@ static void usage(FILE *f)
         "  tsreader record [options] input.ts -o out.ts\n"
         "  tsreader extract [options] input.ts -e prog=N [-e pid=0x100] -o dir/\n"
         "  tsreader live -u addr[:port] [-i iface] | -t host:port\n"
+        "  tsreader list -H 192.168.1.1/auto/v5.1 --duration 10\n"
+        "  tsreader record -H 192.168.1.1/atsc://12/12.1 --duration 30 -o rec.ts\n"
         "\n"
         "Options:\n"
         "  --json         machine-readable JSON output\n"
@@ -89,6 +95,8 @@ int main(int argc, char **argv)
     const char *output = NULL;
     const char *udp_addr = NULL, *tcp_addr = NULL, *udp_iface = NULL;
     int udp_port = 1234, tcp_port = 0;
+    const char *hdhr_host = NULL, *hdhr_tune = NULL;
+    int hdhr_port = 5004;
     int json = 0, quiet = 0, no_epg = 0, tables = 0;
     double duration = 0;
     long max_mb = 0;
@@ -123,7 +131,7 @@ int main(int argc, char **argv)
         {NULL, 0, NULL, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "u:t:i:e:o:qjh", lopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "u:t:i:e:o:qH:h", lopts, NULL)) != -1) {
         switch (opt) {
         case 'j': json = 1; break;
         case 'E': no_epg = 1; break;
@@ -160,6 +168,35 @@ int main(int argc, char **argv)
             break;
         }
         case 'i': udp_iface = optarg; break;
+        case 'H': {
+            // Static buffers: the pointers outlive the option loop and are
+            // used later, in tsr_open_hdhr().
+            static char urlbuf[512];
+            static char hostbuf[256];
+            snprintf(urlbuf, sizeof(urlbuf), "%s", optarg);
+            if (!strncmp(urlbuf, "http://", 7))
+                memmove(urlbuf, urlbuf + 7, strlen(urlbuf) - 6);
+            char *slash = strchr(urlbuf, '/');
+            if (!slash || !slash[1]) {
+                fprintf(stderr,
+                        "tsreader: -H needs host[:port]/tune-url "
+                        "(e.g. 192.168.1.1/auto/v5.1)\n");
+                return 2;
+            }
+            *slash = 0;
+            hdhr_tune = slash + 1;
+            snprintf(hostbuf, sizeof(hostbuf), "%s", urlbuf);
+            char *colon = strrchr(hostbuf, ':');
+            if (colon && !strchr(colon + 1, ':')) {
+                *colon = 0;
+                hdhr_host = hostbuf;
+                hdhr_port = atoi(colon + 1);
+            } else {
+                hdhr_host = hostbuf;
+                hdhr_port = 5004;
+            }
+            break;
+        }
         case 'e':
             if (n_selections < 64)
                 snprintf(selections[n_selections++], sizeof(selections[0]),
@@ -179,7 +216,7 @@ int main(int argc, char **argv)
         usage(stderr);
         return 2;
     }
-    if (strcmp(command, "live") != 0 && !input) {
+    if (strcmp(command, "live") != 0 && !input && !hdhr_host) {
         fprintf(stderr, "tsreader: missing input file\n");
         return 2;
     }
@@ -215,8 +252,24 @@ int main(int argc, char **argv)
     if (max_mb > 0)
         tsr_set_max_bytes(m, (uint64_t)max_mb << 20);
 
+    if (strcmp(command, "record") == 0) {
+        tsr_set_record(m, output);
+        if (!m->record_out) {
+            tsr_free(m);
+            free(m);
+            return 1;
+        }
+    }
+    if (strcmp(command, "extract") == 0)
+        tsr_set_extract_dir(m, output);
+
     int rc = 0;
-    if (strcmp(command, "live") == 0) {
+    if (hdhr_host) {
+        rc = tsr_open_hdhr(m, hdhr_host, hdhr_port, hdhr_tune);
+        if (!rc && !quiet)
+            fprintf(stderr, "tsreader: HDHomeRun %s (Ctrl-C to stop)\n",
+                    m->input_desc);
+    } else if (strcmp(command, "live") == 0) {
         if (tcp_addr)
             rc = tsr_open_tcp(m, tcp_addr, tcp_port);
         else
@@ -225,16 +278,6 @@ int main(int argc, char **argv)
             fprintf(stderr, "tsreader: listening on %s (Ctrl-C to stop)\n",
                     m->input_desc);
     } else {
-        if (strcmp(command, "record") == 0) {
-            tsr_set_record(m, output);
-            if (!m->record_out) {
-                tsr_free(m);
-                free(m);
-                return 1;
-            }
-        }
-        if (strcmp(command, "extract") == 0)
-            tsr_set_extract_dir(m, output);
         rc = tsr_open_file(m, input);
     }
     if (rc) {

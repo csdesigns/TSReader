@@ -32,6 +32,8 @@ tsreader list [--json] [--no-epg] [--tables] input.ts
 tsreader extract -e prog=N [-e pid=0xNNN ...] -o DIR/ input.ts
 tsreader record -o out.ts input.ts
 tsreader live [-u [addr:port]] [-t [addr:port]] [-i iface]
+tsreader list  -H host[:port]/tune-url [--duration N]
+tsreader record -H host[:port]/tune-url --duration N -o out.ts
 ```
 
 - `list` — mux overview: network name (NIT), stream time (TDT), services
@@ -45,6 +47,8 @@ tsreader live [-u [addr:port]] [-t [addr:port]] [-i iface]
   re-encoding, no start-code cleanup).
 - `record` — raw passthrough copy of the transport stream.
 - `live` — UDP multicast / TCP ingress (for capture front-ends).
+- `-H host[:port]/tune-url` — live **HDHomeRun** (SiC) input; works with any
+  command (default port 5004; see [HDHomeRun](#hdhomerun-sic-input)).
 
 ## Supported SI tables (standard layouts)
 
@@ -146,6 +150,39 @@ each ES stream line in `list` shows a codec detail (and `--json` emits
 - CMake prints which mode it chose
   (`tsreader: FFmpeg found — enabling codec probe` / `… not found —
   codec probe disabled`); builds without FFmpeg remain fully supported.
+
+## HDHomeRun (SiC) input
+
+`-H host[:port]/tune-url` receives a live stream straight from an
+HDHomeRun device (default port 5004), natively — no relay:
+
+```sh
+tsreader list   -H 192.168.1.16/auto/v5.1 --duration 10
+tsreader record -H 192.168.1.16/atsc://12/12.1 --duration 30 -o rec.ts
+tsreader extract -H 192.168.1.16/qam:65 -e prog=2 -o out/
+tsreader list -H http://192.168.1.16:5004/auto/v5.1   # http:// prefix optional
+```
+
+- Uses the modern global SiC HTTP API (firmware ≥ v5): `POST /tune`
+  with `{"url": "<tune-url>"}`, then `GET /transport_stream/<id>` is fed
+  into the standard analyzer pipeline, and `DELETE /tuner/<id>` releases
+  the tuner when reading stops (Ctrl-C, `--duration`, `--max-mb`, or
+  device EOF). Tuner release is best-effort: a device that drops the
+  connection leaves nothing to release.
+- The tune URL is passed to the device **unchanged**, so all SiC URL
+  forms work: `auto/<tuner>` (auto-scan), `atsc://M/M.S`,
+  `8vsb:<hz>` / `qam:<n>` (legacy frequency style), `dvbs://…`.
+  Auto-scan tunes can take tens of seconds; the tune request allows 60 s.
+- A stream that goes silent (e.g. signal loss) for 15 s aborts cleanly
+  instead of hanging.
+- Optional dependency: libcurl (in the macOS SDK; on Linux install the
+  distro's `libcurl` development package). CMake prints which mode was
+  chosen (`tsreader: libcurl found — enabling HDHomeRun source`); builds
+  without libcurl remain fully supported, and `-H` then reports that the
+  binary was built without libcurl.
+- IPv6 host literals are not supported (documented limitation).
+- `selftest.sh --hdhr <URL>` records N seconds (`--hdhr-secs`, default
+  10) and then runs the full verification matrix on the capture.
 
 ## Roadmap (not yet implemented)
 

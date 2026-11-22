@@ -28,6 +28,7 @@ add_executable(tsreader
     tsreader_si.c
     tsreader_report.c
     tsreader_probe.c
+    tsreader_hdhr.c
     tsreader_main.c
 )
 target_include_directories(tsreader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -84,6 +85,17 @@ if(AVCODEC_FOUND AND AVFORMAT_FOUND AND AVUTIL_FOUND)
         ${AVCODEC_LIBRARIES} ${AVFORMAT_LIBRARIES} ${AVUTIL_LIBRARIES})
 else()
     message(STATUS "tsreader: FFmpeg not found — codec probe disabled")
+endif()
+
+# Optional HDHomeRun (SiC) source: HTTP tune + transport stream.
+# libcurl is in the macOS SDK and a standard Linux package.
+find_package(CURL QUIET)
+if(CURL_FOUND)
+    message(STATUS "tsreader: libcurl found — enabling HDHomeRun source")
+    target_compile_definitions(tsreader PRIVATE TSR_HAVE_CURL=1)
+    target_link_libraries(tsreader PRIVATE CURL::libcurl)
+else()
+    message(STATUS "tsreader: libcurl not found — HDHomeRun source disabled")
 endif()
 
 install(TARGETS tsreader RUNTIME DESTINATION bin)

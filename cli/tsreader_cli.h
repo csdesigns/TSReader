@@ -154,6 +154,10 @@ typedef struct tsr_event {
     char     audio_visual[8];  // ATSC AV flags summary
 } tsr_event_t;
 
+// Live-reader thread body (returns when the input ends or stop is set).
+struct tsr_mux;
+typedef int (*tsr_live_reader_fn)(struct tsr_mux *m);
+
 typedef struct tsr_mux {
     // input
     char    input_desc[512];
@@ -168,6 +172,14 @@ typedef struct tsr_mux {
     char    udp_iface[64];
     int     live;
     volatile int *stop_flag;
+    int     live_kind;            // 0 = socket (UDP/TCP), 1 = HDHomeRun
+    tsr_live_reader_fn live_reader_fn; // NULL = built-in socket reader
+    volatile int live_reader_done;     // reader thread finished
+    // HDHomeRun source (live_kind == 1)
+    char    hdhr_host[256];
+    int     hdhr_port;
+    char    hdhr_tune[512];
+    int     hdhr_tuner_id;        // -1 = not tuned / released
 
     // feed state
     uint8_t  carry[8192];        // realignment carryover
@@ -233,6 +245,19 @@ int tsr_open_file(tsr_mux_t *m, const char *path);
 int tsr_open_udp(tsr_mux_t *m, const char *addr, int port, const char *iface);
 // Open a TCP input (server must push a raw MPEG-TS).
 int tsr_open_tcp(tsr_mux_t *m, const char *host, int port);
+// Open an HDHomeRun source: POST /tune {"url": tune_url}, then stream
+// GET /transport_stream/<id>. The tuner is released when reading stops.
+// tune_url is passed to the device unchanged (auto/v5.1, atsc://12/12.1,
+// 8vsb:687000000, qam:65, ...). Requires a libcurl-enabled build.
+int tsr_open_hdhr(tsr_mux_t *m, const char *host, int port,
+                  const char *tune_url);
+// Thread body for the HDHomeRun transport reader (see tsr_open_hdhr).
+int tsr_hdhr_reader(tsr_mux_t *m);
+// Start the wall-clock used for --duration / --max-mb accounting. Live
+// sources call this when the stream becomes available (for HDHomeRun,
+// after the tune handshake), so duration limits are measured from real
+// streaming, not from process start.
+void tsr_mark_stream_start(tsr_mux_t *m);
 
 // Set output options (before processing).
 void tsr_set_record(tsr_mux_t *m, const char *path);
