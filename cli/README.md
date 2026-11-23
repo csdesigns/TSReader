@@ -103,6 +103,15 @@ limits found in practice:
   is still not extracted faithfully by any build — for such
   multiplexes, verify extract with an independent byte-level payload
   extraction.
+- Raw 0x81 (AC-3/DTS) content: ts2es drops short byte runs around
+  incidental `00 00 01 xx` start-code-like sequences inside the raw
+  audio bitstream (and pure `0xFF` filler runs); the engine keeps the
+  payload byte-faithful, so the two can differ by exactly those runs on
+  affected multiplexes (observed in the wild: 124 × 7 B
+  `00 00 01 BD` chunks on a 20 s ATSC capture). `selftest.sh`
+  classifies this: when the oracle output is a byte subsequence of the
+  engine's and every removed segment is one of the known quirk patterns,
+  the extract check reports WARN (not FAIL); any other divergence fails.
 - The engine's extract is raw payload bytes (PES where the mux carries
   PES, raw Annex B / ADTS where it doesn't) — byte-exact by design.
 
@@ -163,12 +172,21 @@ tsreader extract -H 192.168.1.16/qam:65 -e prog=2 -o out/
 tsreader list -H http://192.168.1.16:5004/auto/v5.1   # http:// prefix optional
 ```
 
-- Uses the modern global SiC HTTP API (firmware ≥ v5): `POST /tune`
-  with `{"url": "<tune-url>"}`, then `GET /transport_stream/<id>` is fed
-  into the standard analyzer pipeline, and `DELETE /tuner/<id>` releases
-  the tuner when reading stops (Ctrl-C, `--duration`, `--max-mb`, or
-  device EOF). Tuner release is best-effort: a device that drops the
-  connection leaves nothing to release.
+- Uses the standard SiC HTTP API. Two firmware generations are handled,
+  tried in order:
+  1. **Direct tune-URL streaming** (older firmware and front-ends):
+     `GET /<tune-url>` — the tune URL doubles as the stream URL; the
+     first byte of a live stream is the TS sync byte `0x47`, anything
+     else aborts this attempt. Closing the connection releases the
+     tuner.
+  2. **Global API** (newer firmware): `POST /tune` with
+     `{"url": "<tune-url>"}` → `GET /transport_stream/<id>`, then
+     `DELETE /tuner/<id>` when reading stops.
+
+  Tuner release is best-effort in both paths: a device that drops the
+  connection leaves nothing to release. A slow auto-scan does not eat
+  into `--duration` — the duration clock starts at the first stream
+  byte.
 - The tune URL is passed to the device **unchanged**, so all SiC URL
   forms work: `auto/<tuner>` (auto-scan), `atsc://M/M.S`,
   `8vsb:<hz>` / `qam:<n>` (legacy frequency style), `dvbs://…`.

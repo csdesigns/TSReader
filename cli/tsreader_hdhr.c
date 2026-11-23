@@ -1,10 +1,22 @@
 // tsreader_hdhr.c — HDHomeRun (SiC) source: HTTP tune + transport stream.
 //
-// Speaks the standard HDHomeRun HTTP API (default port 5004):
+// Two generations of the HDHomeRun HTTP API (default port 5004) are
+// handled, tried in this order:
 //
-//   POST   /tune                {"url": "<tune-url>"}   -> {"id": N, ...}
-//   GET    /transport_stream/N  -> raw MPEG-TS byte stream (continuous)
-//   DELETE /tuner/N             release the tuner
+// 1. Direct tune-URL streaming (older firmware, and devices/proxies in
+//    front of them): the tune URL doubles as the stream URL.
+//
+//       GET    /<tune-url>           -> raw MPEG-TS byte stream
+//
+//    The first byte of a live stream is always the TS sync byte 0x47;
+//    anything else (an error page, JSON) aborts the attempt. Closing the
+//    connection releases the tuner.
+//
+// 2. Global API (newer firmware):
+//
+//       POST   /tune                 {"url": "<tune-url>"} -> {"id": N, ...}
+//       GET    /transport_stream/N   -> raw MPEG-TS byte stream
+//       DELETE /tuner/N              release the tuner
 //
 // The tune URL is passed through to the device unchanged, so every URL
 // form the firmware accepts works:
@@ -145,7 +157,9 @@ static int hdhr_tune(const char *host, int port, const char *tune_url,
         return 1;
     }
     // Success looks like: {"id":1,"source_url":"...","transport_stream":"..."}
-    const char *p = strstr(rb.buf, "\"id\"");
+    // rb.buf is NULL when the response carried no body at all.
+    const char *resp = rb.buf ? rb.buf : "";
+    const char *p = strstr(resp, "\"id\"");
     if (p) {
         p = strchr(p, ':');
         if (p)
@@ -153,7 +167,7 @@ static int hdhr_tune(const char *host, int port, const char *tune_url,
     }
     if (http_code != 200 || *tuner_id < 0) {
         snprintf(err, errlen, "HDHomeRun tune rejected (HTTP %ld): %s",
-                 http_code, rb.buf[0] ? rb.buf : "(empty response)");
+                 http_code, resp[0] ? resp : "(empty response)");
         free(rb.buf);
         return 1;
     }
@@ -200,6 +214,35 @@ static size_t discard_cb(char *p, size_t s, size_t n, void *ud)
     return s * n;
 }
 
+// Direct tune-URL streaming (GET /<tune-url>): the first data chunk of a
+// live transport stream always starts with the TS sync byte 0x47. If it
+// doesn't (error page, JSON, ...), abort the transfer and let the caller
+// fall back to the global /tune API.
+typedef struct {
+    tsr_mux_t *m;
+    int first;    // no data seen yet
+    int got_ts;   // first chunk started with 0x47
+} direct_state_t;
+
+static size_t direct_cb(char *p, size_t s, size_t n, void *ud)
+{
+    direct_state_t *d = ud;
+    tsr_mux_t *m = d->m;
+    size_t total = s * n;
+    if (m->stop_flag && *m->stop_flag)
+        return 0;
+    if (d->first) {
+        d->first = 0;
+        if (total == 0 || (unsigned char)p[0] != 0x47) {
+            d->got_ts = 0;
+            return 0;
+        }
+        d->got_ts = 1;
+    }
+    tsr_feed(m, (const uint8_t *)p, total);  // marks stream start on first byte
+    return total;
+}
+
 #endif // TSR_HAVE_CURL
 
 // ---------------------------------------------------------------------------
@@ -220,18 +263,15 @@ int tsr_open_hdhr(tsr_mux_t *m, const char *host, int port,
     m->hdhr_port = port;
     snprintf(m->hdhr_tune, sizeof(m->hdhr_tune), "%s", tune_url);
 
-    char err[1024];
-    int id = -1;
-    if (hdhr_tune(host, port, tune_url, &id, err, sizeof(err))) {
-        fprintf(stderr, "tsreader: %s\n", err);
-        return 1;
-    }
-    m->hdhr_tuner_id = id;
+    // No network I/O here: the reader thread tries the direct tune-URL
+    // stream first and falls back to POST /tune (firmware-dependent), so
+    // a slow auto-scan does not block the open.
+    m->hdhr_tuner_id = -1;
     m->live_kind = 1;
     m->live_reader_fn = tsr_hdhr_reader;
     m->live = 1;
     snprintf(m->input_desc, sizeof(m->input_desc),
-             "hdhr://%s:%d/%s (tuner %d)", host, port, tune_url, id);
+             "hdhr://%s:%d/%s", host, port, tune_url);
     return 0;
 #else
     (void)m;
@@ -250,35 +290,88 @@ int tsr_hdhr_reader(tsr_mux_t *m)
 #ifdef TSR_HAVE_CURL
     char url[1024];
     CURL *e;
-    CURLcode code;
+    CURLcode code = CURLE_OK;
+    int got_ts = 0;
+    int tuner_id = -1;
 
-    snprintf(url, sizeof(url), "http://%s:%d/transport_stream/%d",
-             m->hdhr_host, m->hdhr_port, m->hdhr_tuner_id);
-    e = curl_easy_init();
-    if (!e) {
-        fprintf(stderr, "tsreader: HDHomeRun: curl_easy_init failed\n");
-        m->live_reader_done = 1;
-        return 1;
-    }
-    curl_easy_setopt(e, CURLOPT_URL, url);
-    curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, ts_feed_cb);
-    curl_easy_setopt(e, CURLOPT_WRITEDATA, m);
-    curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(e, CURLOPT_NOPROXY, "*");
     // The stream is continuous: no overall timeout. Curl aborts by itself
-    // if the device goes silent (e.g. signal loss) for 15 s.
-    curl_easy_setopt(e, CURLOPT_LOW_SPEED_LIMIT, 1L);   // 1 byte/s
-    curl_easy_setopt(e, CURLOPT_LOW_SPEED_TIME, 15L);
-    // Duration/byte limits are measured from now (stream start, after the
-    // tune handshake), not from process start.
-    tsr_mark_stream_start(m);
-    code = curl_easy_perform(e);
-    curl_easy_cleanup(e);
+    // if the device goes silent (e.g. signal loss) for 15 s. Duration / byte
+    // limits count from the first stream byte (tsr_feed marks the wall
+    // clock), so a slow auto-scan does not eat into --duration.
 
-    hdhr_release(m->hdhr_host, m->hdhr_port, m->hdhr_tuner_id);
-    m->hdhr_tuner_id = -1;
+    // Attempt 1: direct tune-URL streaming (older firmware).
+    direct_state_t ds = { m, 1, 0 };
+    snprintf(url, sizeof(url), "http://%s:%d/%s",
+             m->hdhr_host, m->hdhr_port, m->hdhr_tune);
+    e = curl_easy_init();
+    if (e) {
+        curl_easy_setopt(e, CURLOPT_URL, url);
+        curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, direct_cb);
+        curl_easy_setopt(e, CURLOPT_WRITEDATA, &ds);
+        curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 5L);
+        curl_easy_setopt(e, CURLOPT_NOPROXY, "*");
+        curl_easy_setopt(e, CURLOPT_LOW_SPEED_LIMIT, 1L);   // 1 byte/s
+        curl_easy_setopt(e, CURLOPT_LOW_SPEED_TIME, 15L);
+        code = curl_easy_perform(e);
+        got_ts = ds.got_ts;
+        curl_easy_cleanup(e);
+        e = NULL;
+        if (!got_ts && code != CURLE_COULDNT_CONNECT &&
+            code != CURLE_WRITE_ERROR && code != CURLE_OPERATION_TIMEDOUT &&
+            code != CURLE_RECV_ERROR && code != CURLE_GOT_NOTHING)
+            fprintf(stderr, "tsreader: HDHomeRun direct stream: %s\n",
+                    curl_easy_strerror(code));
+    }
+
+    // Attempt 2 (fallback): global SiC API (firmware with POST /tune).
+    if (!got_ts) {
+        if (code == CURLE_COULDNT_CONNECT) {
+            fprintf(stderr, "tsreader: HDHomeRun %s:%d not reachable\n",
+                    m->hdhr_host, m->hdhr_port);
+            m->live_reader_done = 1;
+            return 1;
+        }
+        char err[1024];
+        if (hdhr_tune(m->hdhr_host, m->hdhr_port, m->hdhr_tune,
+                      &tuner_id, err, sizeof(err))) {
+            fprintf(stderr, "tsreader: %s\n", err);
+            m->live_reader_done = 1;
+            return 1;
+        }
+        m->hdhr_tuner_id = tuner_id;
+        snprintf(url, sizeof(url), "http://%s:%d/transport_stream/%d",
+                 m->hdhr_host, m->hdhr_port, tuner_id);
+        e = curl_easy_init();
+        if (!e) {
+            fprintf(stderr, "tsreader: HDHomeRun: curl_easy_init failed\n");
+            m->live_reader_done = 1;
+            return 1;
+        }
+        curl_easy_setopt(e, CURLOPT_URL, url);
+        curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, ts_feed_cb);
+        curl_easy_setopt(e, CURLOPT_WRITEDATA, m);
+        curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, 5L);
+        curl_easy_setopt(e, CURLOPT_NOPROXY, "*");
+        curl_easy_setopt(e, CURLOPT_LOW_SPEED_LIMIT, 1L);   // 1 byte/s
+        curl_easy_setopt(e, CURLOPT_LOW_SPEED_TIME, 15L);
+        code = curl_easy_perform(e);
+        curl_easy_cleanup(e);
+        // Closing the stream releases the tuner (direct mode); otherwise
+        // release it explicitly. Best effort: a dead device needs nothing.
+        hdhr_release(m->hdhr_host, m->hdhr_port, tuner_id);
+        m->hdhr_tuner_id = -1;
+        m->live_reader_done = 1;
+
+        if (code != CURLE_OK && code != CURLE_WRITE_ERROR &&
+            code != CURLE_OPERATION_TIMEDOUT && code != CURLE_RECV_ERROR &&
+            code != CURLE_GOT_NOTHING)
+            fprintf(stderr, "tsreader: HDHomeRun transport ended: %s\n",
+                    curl_easy_strerror(code));
+        return 0;
+    }
+
+    // Direct stream ran; closing its connection releases the tuner.
     m->live_reader_done = 1;
-
     if (code != CURLE_OK && code != CURLE_WRITE_ERROR &&
         code != CURLE_OPERATION_TIMEDOUT && code != CURLE_RECV_ERROR &&
         code != CURLE_GOT_NOTHING)
